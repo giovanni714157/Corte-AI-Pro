@@ -1,231 +1,498 @@
-import os, json, uuid, subprocess, threading, re, shutil, html, sqlite3, hashlib, secrets
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+import os
+import re
+import uuid
+import threading
+import subprocess
 from pathlib import Path
 
-ROOT=Path(__file__).resolve().parent
-DATA=ROOT/'data'; OUT=DATA/'outputs'; UP=DATA/'uploads'; JOBDIR=DATA/'jobs'
-for d in (DATA,OUT,UP,JOBDIR): d.mkdir(parents=True,exist_ok=True)
-JOBS={}
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI=None
-client=OpenAI(api_key=os.getenv('OPENAI_API_KEY')) if (OpenAI and os.getenv('OPENAI_API_KEY')) else None
-DB=DATA/'app.db'
-def db():
-    c=sqlite3.connect(DB); c.execute('CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, password_hash TEXT, active INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)'); c.commit(); return c
-def hashpw(p): return hashlib.sha256(p.encode()).hexdigest()
-db().close()
+from flask import Flask, request, jsonify, send_from_directory
 
-def run(args, timeout=1800):
-    p=subprocess.run(args,capture_output=True,text=True,timeout=timeout)
-    if p.returncode:
-        raise RuntimeError((p.stderr or p.stdout)[-5000:] or 'Processamento falhou')
-    return p.stdout
 
-def probe(path):
-    j=json.loads(run(['ffprobe','-v','error','-show_entries','format=duration:stream=width,height','-of','json',str(path)]))
-    dur=float(j.get('format',{}).get('duration') or 0)
-    vs=[s for s in j.get('streams',[]) if s.get('width')]
-    return dur,(vs[0]['width'],vs[0]['height']) if vs else (0,0)
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
 
-def analyze_local(src,dur,target,count):
-    # Real audio-energy + scene-change analysis. It does not invent clips.
-    step=max(6,target/2); candidates=[]; t=0
-    while t+target<=dur+0.01:
-        candidates.append((t,min(t+target,dur))); t+=step
-    if not candidates: candidates=[(0,dur)]
-    scored=[]
-    for a,b in candidates:
+BASE_DIR = Path(__file__).resolve().parent
+
+DATA_DIR = BASE_DIR / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+OUTPUT_DIR = DATA_DIR / "outputs"
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+PORT = int(os.environ.get("PORT", "3000"))
+
+app = Flask(__name__, static_folder="static")
+
+# Jobs ficam em memória nesta versão.
+jobs = {}
+
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def run_command(command):
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stdout[-5000:])
+
+    return result.stdout
+
+
+def get_video_duration(video_path):
+    output = run_command([
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path)
+    ])
+
+    return float(output.strip())
+
+
+# ============================================================
+# ENCONTRAR MOMENTOS
+# ============================================================
+
+def find_best_moments(video_path, duration, number_of_clips, clip_duration):
+
+    """
+    Sistema gratuito para encontrar momentos automaticamente.
+
+    Ele analisa o volume do áudio em pequenas janelas.
+    Momentos com maior atividade sonora recebem prioridade.
+
+    Não usa OpenAI nem outra API paga.
+    """
+
+    window = 8
+
+    samples = []
+
+    total_windows = max(1, int(duration / window))
+
+    for index in range(total_windows):
+
+        start = index * window
+
+        if start >= duration:
+            break
+
+        current_duration = min(window, duration - start)
+
         try:
-            out=run(['ffmpeg','-hide_banner','-ss',str(a),'-t',str(b-a),'-i',str(src),'-af','volumedetect','-f','null','-'],120)
-            m=re.search(r'mean_volume:\s*(-?[\d.]+) dB',out); pk=re.search(r'max_volume:\s*(-?[\d.]+) dB',out)
-            mean=float(m.group(1)) if m else -45; peak=float(pk.group(1)) if pk else -20
-        except Exception: mean,peak=-45,-20
-        # Avoid only the first seconds; reward energetic speech and dynamic range.
-        energy=max(0,min(70,mean+45)); dyn=max(0,min(20,(peak-mean)*2)); pos=10*(1-abs((a+b)/2-dur/2)/max(dur/2,1))
-        scored.append({'start':a,'end':b,'local_score':round(energy+dyn+pos,2),'text':''})
-    scored.sort(key=lambda x:x['local_score'],reverse=True)
-    chosen=[]
-    for c in scored:
-        if all(c['end']<=x['start'] or c['start']>=x['end'] for x in chosen):
-            chosen.append(c)
-        if len(chosen)>=count: break
-    return sorted(chosen,key=lambda x:x['start'])
 
-def transcribe(audio):
-    if not client: return None
-    with open(audio,'rb') as f:
-        r=client.audio.transcriptions.create(model='gpt-4o-transcribe',file=f,response_format='verbose_json',timestamp_granularities=['segment'])
-    return {'text':getattr(r,'text',''),'segments':[{'start':float(s.start),'end':float(s.end),'text':s.text.strip()} for s in (getattr(r,'segments',[]) or [])]}
+            output = run_command([
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-ss",
+                str(start),
+                "-t",
+                str(current_duration),
+                "-i",
+                str(video_path),
+                "-af",
+                "volumedetect",
+                "-f",
+                "null",
+                "-"
+            ])
 
-def ai_rank(cands):
-    if not client or not cands: return cands
-    payload=[{'id':i,'start':c['start'],'end':c['end'],'text':c.get('text','')[:1500]} for i,c in enumerate(cands)]
+            match = re.search(
+                r"mean_volume:\s*(-?\d+(?:\.\d+)?) dB",
+                output
+            )
+
+            if match:
+                volume = float(match.group(1))
+            else:
+                volume = -100
+
+            samples.append({
+                "start": start,
+                "volume": volume
+            })
+
+        except Exception:
+            continue
+
+    # Mais alto = mais atividade sonora
+    samples.sort(
+        key=lambda item: item["volume"],
+        reverse=True
+    )
+
+    selected = []
+
+    for sample in samples:
+
+        start = sample["start"]
+
+        # Mantém o corte dentro do vídeo
+        start = max(
+            0,
+            min(start, max(0, duration - clip_duration))
+        )
+
+        # Evita cortes muito próximos
+        too_close = False
+
+        for existing in selected:
+
+            if abs(existing - start) < clip_duration * 0.7:
+                too_close = True
+                break
+
+        if too_close:
+            continue
+
+        selected.append(start)
+
+        if len(selected) >= number_of_clips:
+            break
+
+    # Caso o vídeo não tenha áudio analisável
+    if not selected:
+
+        selected = []
+
+        for i in range(number_of_clips):
+
+            start = i * clip_duration
+
+            if start >= duration:
+                break
+
+            selected.append(
+                min(start, max(0, duration - clip_duration))
+            )
+
+    return selected
+
+
+# ============================================================
+# GERAR CORTES
+# ============================================================
+
+def create_clips(job_id, video_path):
+
     try:
-        r=client.responses.create(model=os.getenv('OPENAI_RANK_MODEL','gpt-5.6-luna'),input=[
-          {'role':'system','content':'Você é editor de vídeos curtos. Dê nota 0-100 para cada trecho. Valorize gancho, contexto completo, surpresa, utilidade, emoção, opinião forte e payoff. Penalize início no meio da frase e trecho sem conclusão. Responda JSON com scores: [{"id":0,"score":87}].'},
-          {'role':'user','content':json.dumps(payload,ensure_ascii=False)}],text={'format':{'type':'json_object'}})
-        obj=json.loads(r.output_text); mp={int(x['id']):float(x['score']) for x in obj.get('scores',[])}
-        for i,c in enumerate(cands): c['ai_score']=mp.get(i,c['local_score'])
-    except Exception as e:
-        for c in cands: c['ai_score']=c['local_score']
-    return cands
 
-def srt_for(trans,start,end,path):
-    if not trans or not trans.get('segments'): return None
-    def ts(v):
-        v=max(0,v); ms=int((v-int(v))*1000); z=int(v); return f'{z//3600:02d}:{z%3600//60:02d}:{z%60:02d},{ms:03d}'
-    n=1; lines=[]
-    for s in trans['segments']:
-        a=max(start,s['start']); b=min(end,s['end'])
-        if b<=a: continue
-        text=s['text'].replace('-->','—>')
-        lines += [str(n),f'{ts(a-start)} --> {ts(b-start)}',text,'']; n+=1
-    if not lines: return None
-    path.write_text('\n'.join(lines),encoding='utf-8'); return path
+        jobs[job_id]["status"] = "processing"
+        jobs[job_id]["progress"] = 5
+        jobs[job_id]["message"] = "Lendo vídeo..."
 
-def render(src,clip,out,aspect,res,captions,srt,zoom):
-    sizes={'1080p':1080,'720p':720,'480p':480}; base=sizes.get(res,1080)
-    if aspect=='9:16': W,H=base,round(base*16/9)
-    elif aspect=='1:1': W=H=base
-    else: W,H=(1920,1080) if res=='1080p' else ((1280,720) if res=='720p' else (854,480))
-    if aspect in ('9:16','1:1'):
-        vf=f'scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}'
-    else:
-        vf=f'scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2'
-    if zoom: vf+=',eq=contrast=1.03:brightness=0.01'
-    if captions and srt:
-        p=str(srt).replace('\\','/').replace(':','\\:')
-        vf+=f",subtitles='{p}'"
-    run(['ffmpeg','-y','-ss',str(clip['start']),'-t',str(clip['end']-clip['start']),'-i',str(src),'-vf',vf,'-c:v','libx264','-preset','veryfast','-crf','19','-c:a','aac','-b:a','192k','-movflags','+faststart',str(out)],900)
+        duration = get_video_duration(video_path)
 
-def download_youtube(url,dest):
-    ytdlp=shutil.which('yt-dlp') or '/usr/local/bin/yt-dlp'
-    if not Path(ytdlp).exists(): raise RuntimeError('yt-dlp não está instalado. Rode pelo Docker ou instale yt-dlp no servidor.')
-    run([ytdlp,'--no-playlist','-f','bv*+ba/b','--merge-output-format','mp4','-o',str(dest),url],1200)
+        if duration < 3:
+            raise RuntimeError(
+                "O vídeo é muito curto."
+            )
 
-def process(j):
+        # Configuração simples para uso pessoal
+        number_of_clips = 5
+
+        requested_duration = 45
+
+        clip_duration = min(
+            requested_duration,
+            duration
+        )
+
+        jobs[job_id]["progress"] = 10
+        jobs[job_id]["message"] = (
+            "Procurando os melhores momentos..."
+        )
+
+        moments = find_best_moments(
+            video_path,
+            duration,
+            number_of_clips,
+            clip_duration
+        )
+
+        clips = []
+
+        total = len(moments)
+
+        for index, start in enumerate(moments):
+
+            clip_number = index + 1
+
+            output_name = (
+                f"{job_id}_corte_{clip_number:02d}.mp4"
+            )
+
+            output_path = OUTPUT_DIR / output_name
+
+            jobs[job_id]["message"] = (
+                f"Gerando corte {clip_number}/{total}..."
+            )
+
+            jobs[job_id]["progress"] = (
+                20 + int((index / max(1, total)) * 70)
+            )
+
+            # Formato vertical 9:16
+            video_filter = (
+                "scale=720:-2,"
+                "crop=ih*9/16:ih"
+            )
+
+            run_command([
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+
+                "-ss",
+                str(start),
+
+                "-i",
+                str(video_path),
+
+                "-t",
+                str(clip_duration),
+
+                "-vf",
+                video_filter,
+
+                "-c:v",
+                "libx264",
+
+                "-preset",
+                "veryfast",
+
+                "-crf",
+                "23",
+
+                "-c:a",
+                "aac",
+
+                "-b:a",
+                "128k",
+
+                "-movflags",
+                "+faststart",
+
+                str(output_path)
+            ])
+
+            clips.append({
+                "name": output_name,
+                "url": "/outputs/" + output_name
+            })
+
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["progress"] = 100
+        jobs[job_id]["message"] = (
+            f"Pronto! {len(clips)} cortes foram gerados."
+        )
+        jobs[job_id]["clips"] = clips
+
+    except Exception as error:
+
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["progress"] = 0
+        jobs[job_id]["message"] = "Erro no processamento."
+        jobs[job_id]["error"] = str(error)
+
+
+# ============================================================
+# PÁGINA PRINCIPAL
+# ============================================================
+
+@app.route("/")
+def index():
+
+    return send_from_directory(
+        "static",
+        "index.html"
+    )
+
+
+# ============================================================
+# DOWNLOAD DOS CORTES
+# ============================================================
+
+@app.route("/outputs/<path:filename>")
+def download_output(filename):
+
+    return send_from_directory(
+        OUTPUT_DIR,
+        filename,
+        as_attachment=True
+    )
+
+
+# ============================================================
+# CRIAR JOB
+# ============================================================
+
+@app.route("/api/jobs", methods=["POST"])
+def create_job():
+
+    job_id = uuid.uuid4().hex
+
+    uploaded_file = request.files.get("video")
+
+    youtube_url = request.form.get(
+        "youtube_url",
+        ""
+    ).strip()
+
     try:
-        j['status']='preparando'; j['progress']=5
-        src=Path(j['dir'])/'source.mp4'
-        if j['input_type']=='youtube':
-            j['status']='baixando vídeo do YouTube'; j['progress']=10; download_youtube(j['url'],src)
-        else: shutil.copy2(j['upload'],src)
-        dur,_=probe(src)
-        if dur<=0: raise RuntimeError('Vídeo sem duração válida.')
-        j['status']='analisando áudio e cenas'; j['progress']=25
-        audio=Path(j['dir'])/'audio.wav'
-        run(['ffmpeg','-y','-i',str(src),'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le',str(audio)],600)
-        j['status']='transcrevendo com IA' if client else 'analisando localmente (IA opcional)'; j['progress']=38
-        trans=transcribe(audio); j['ai_enabled']=bool(client)
-        cands=analyze_local(src,dur,j['duration'],j['count'])
-        if trans:
-            for c in cands:
-                c['text']=' '.join(s['text'] for s in trans['segments'] if s['end']>c['start'] and s['start']<c['end'])
-            cands=ai_rank(cands)
-        cands=sorted(cands,key=lambda c:c.get('ai_score',c['local_score']),reverse=True)[:j['count']]
-        j['clips']=cands
-        j['status']='renderizando cortes'; j['progress']=52
-        for i,c in enumerate(cands,1):
-            srt=None
-            if j['captions']:
-                srt=srt_for(trans,c['start'],c['end'],Path(j['dir'])/f'corte_{i}.srt')
-            out=OUT/f"{j['id']}_corte_{i:02d}.mp4"
-            render(src,c,out,j['aspect'],j['resolution'],j['captions'],srt,j['zoom'])
-            c['n']=i;c['url']='/outputs/'+out.name;c['score']=round(c.get('ai_score',c['local_score']),1)
-            j['progress']=52+int(i/len(cands)*45)
-        j['status']='concluído';j['progress']=100
-    except Exception as e:
-        j['status']='erro';j['error']=str(e);j['progress']=100
 
-def parse_multipart(handler):
-    # Dependency-free multipart parser (works on Python 3.13+, where cgi was removed).
-    import email
-    ctype=handler.headers.get('content-type','')
-    boundary=None
-    m=re.search(r'boundary=(?:"([^"]+)"|([^;]+))',ctype)
-    if m: boundary=(m.group(1) or m.group(2)).encode()
-    if not boundary: raise RuntimeError('multipart/form-data sem boundary')
-    length=int(handler.headers.get('content-length','0'))
-    body=handler.rfile.read(length)
-    marker=b'--'+boundary
-    fields={}
-    for part in body.split(marker):
-        part=part.strip(b'\r\n-')
-        if not part: continue
-        if b'\r\n\r\n' not in part: continue
-        hb,data=part.split(b'\r\n\r\n',1)
-        headers=email.message_from_bytes(hb+b'\r\n')
-        cd=headers.get('content-disposition','')
-        nm=re.search(r'name="([^"]+)"',cd)
-        if not nm: continue
-        name=nm.group(1)
-        fm=re.search(r'filename="([^"]*)"',cd)
-        if fm:
-            fields[name]={'filename':fm.group(1),'data':data.rstrip(b'\r\n')}
-        else:
-            fields[name]=data.rstrip(b'\r\n').decode('utf-8','replace')
-    class FS:
-        def __contains__(self,k): return k in fields
-        def __getitem__(self,k):
-            v=fields[k]
-            return type('Part',(),{'file':__import__('io').BytesIO(v['data'])})()
-        def getfirst(self,k,default=''): return fields.get(k,default) if isinstance(fields.get(k,default),str) else default
-    return FS()
+        # ----------------------------------------------------
+        # UPLOAD NORMAL
+        # ----------------------------------------------------
 
+        if uploaded_file:
 
-def read_json(handler):
-    n=int(handler.headers.get('content-length','0')); raw=handler.rfile.read(n) if n else b'{}'; return json.loads(raw.decode() or '{}')
+            extension = (
+                Path(uploaded_file.filename or "video.mp4")
+                .suffix
+                .lower()
+            )
 
-def checkout_url(): return os.getenv('KIWIFY_CHECKOUT_URL','')
+            if not extension:
+                extension = ".mp4"
 
-class H(BaseHTTPRequestHandler):
-    def send_json(self,code,obj):
-        b=json.dumps(obj,ensure_ascii=False).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
-    def do_GET(self):
-        p=urlparse(self.path).path
-        if p=='/api/config':
-            self.send_json(200,{'price':'R$ 120/mês','checkout_url':checkout_url()});return
-        if p=='/':
-            b=(ROOT/'static/index.html').read_bytes();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
-        if p.startswith('/api/jobs/'):
-            j=JOBS.get(p.rsplit('/',1)[-1]);self.send_json(200,j or {'error':'Projeto não encontrado'});return
-        if p.startswith('/outputs/'):
-            fp=OUT/Path(p).name
-            if not fp.exists(): self.send_error(404);return
-            b=fp.read_bytes();self.send_response(200);self.send_header('Content-Type','video/mp4');self.send_header('Content-Length',str(len(b)));self.send_header('Content-Disposition',f'attachment; filename="{fp.name}"');self.end_headers();self.wfile.write(b);return
-        self.send_error(404)
-    def do_POST(self):
-        if self.path=='/api/auth/register':
+            video_path = (
+                UPLOAD_DIR /
+                f"{job_id}{extension}"
+            )
+
+            uploaded_file.save(video_path)
+
+        # ----------------------------------------------------
+        # YOUTUBE
+        # ----------------------------------------------------
+
+        elif youtube_url:
+
+            video_path = (
+                UPLOAD_DIR /
+                f"{job_id}.mp4"
+            )
+
             try:
-                x=read_json(self); email=x.get('email','').strip().lower(); pw=x.get('password','')
-                if len(pw)<8 or '@' not in email: return self.send_json(400,{'error':'Email válido e senha de 8+ caracteres.'})
-                c=db(); c.execute('INSERT INTO users(email,password_hash) VALUES(?,?)',(email,hashpw(pw))); c.commit(); c.close(); return self.send_json(200,{'ok':True,'message':'Conta criada. Ative sua assinatura para usar o editor.'})
-            except sqlite3.IntegrityError: return self.send_json(409,{'error':'Este email já está cadastrado.'})
-        if self.path=='/api/auth/login':
-            x=read_json(self); email=x.get('email','').strip().lower(); pw=x.get('password',''); c=db(); row=c.execute('SELECT id,email,active FROM users WHERE email=? AND password_hash=?',(email,hashpw(pw))).fetchone(); c.close()
-            if not row: return self.send_json(401,{'error':'Email ou senha inválidos.'})
-            return self.send_json(200,{'ok':True,'user':{'id':row[0],'email':row[1],'active':bool(row[2])}})
-        if self.path=='/api/kiwify/webhook':
-            # Store subscription state. Configure the webhook in Kiwify to send approved/cancelled/refunded/renewal events here.
-            x=read_json(self); email=(x.get('Customer') or {}).get('email') or x.get('email') or (x.get('customer') or {}).get('email')
-            event=str(x.get('webhook_event_type') or x.get('event') or x.get('status') or '').lower()
-            if email:
-                active=0 if any(k in event for k in ['refund','cancel','chargeback','failed','refused','expired']) else 1
-                c=db(); c.execute('UPDATE users SET active=? WHERE email=?',(active,email.lower())); c.commit(); c.close()
-            return self.send_json(200,{'received':True})
-        if self.path!='/api/jobs': self.send_error(404);return
-        fs=parse_multipart(self)
-        yt=fs.getfirst('youtubeUrl','').strip(); fileitem=fs['video'] if 'video' in fs else None
-        if not yt and not fileitem: return self.send_json(400,{'error':'Cole um link do YouTube ou envie um vídeo.'})
-        jid=uuid.uuid4().hex; d=JOBDIR/jid;d.mkdir(parents=True)
-        def g(k,default): return fs.getfirst(k,default)
-        j={'id':jid,'dir':str(d),'input_type':'youtube' if yt else 'upload','url':yt,'upload':None,'count':max(1,min(20,int(g('count','5')))),'duration':max(10,min(180,int(g('duration','45')))),'aspect':g('aspect','9:16'),'resolution':g('resolution','1080p'),'captions':g('captions','off')=='on','zoom':g('zoom','on')=='on','status':'na fila','progress':2,'clips':[],'ai_enabled':bool(client)}
-        if fileitem:
-            up=UP/(jid+'.mp4');up.write_bytes(fileitem.file.read());j['upload']=str(up)
-        JOBS[jid]=j;threading.Thread(target=process,args=(j,),daemon=True).start();self.send_json(200,{'id':jid,'ai_enabled':bool(client)})
 
-print('Corte AI Pro V3 em http://127.0.0.1:3000 | IA:',bool(client))
-ThreadingHTTPServer(('0.0.0.0',3000),H).serve_forever()
+                run_command([
+                    "yt-dlp",
+
+                    "--no-playlist",
+
+                    "-f",
+                    "bv*+ba/b",
+
+                    "--merge-output-format",
+                    "mp4",
+
+                    "-o",
+                    str(video_path),
+
+                    youtube_url
+                ])
+
+            except Exception as error:
+
+                raise RuntimeError(
+                    "O YouTube recusou o acesso a este vídeo. "
+                    "Tente um vídeo que você tenha autorização "
+                    "para usar ou envie o MP4 diretamente."
+                ) from error
+
+        else:
+
+            return jsonify({
+                "error":
+                    "Envie um vídeo ou coloque uma URL do YouTube."
+            }), 400
+
+        # ----------------------------------------------------
+        # CRIA JOB
+        # ----------------------------------------------------
+
+        jobs[job_id] = {
+            "status": "queued",
+            "progress": 1,
+            "message": "Vídeo recebido. Iniciando...",
+            "clips": []
+        }
+
+        thread = threading.Thread(
+            target=create_clips,
+            args=(job_id, video_path),
+            daemon=True
+        )
+
+        thread.start()
+
+        return jsonify({
+            "id": job_id
+        })
+
+    except Exception as error:
+
+        return jsonify({
+            "error": str(error)
+        }), 400
+
+
+# ============================================================
+# CONSULTAR JOB
+# ============================================================
+
+@app.route("/api/jobs/<job_id>")
+def get_job(job_id):
+
+    if job_id not in jobs:
+
+        return jsonify({
+            "error": "Processamento não encontrado."
+        }), 404
+
+    return jsonify(
+        jobs[job_id]
+    )
+
+
+# ============================================================
+# API CONFIG
+# ============================================================
+
+@app.route("/api/config")
+def config():
+
+    return jsonify({
+        "personal_mode": True,
+        "openai_required": False,
+        "kiwify_required": False
+    })
+
+
+# ============================================================
+# INICIAR
+# ============================================================
+
+if __name__ == "__main__":
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT
+)
